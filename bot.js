@@ -13,6 +13,81 @@ process.on("unhandledRejection", (err) =>
 );
 
 (async () => {
+  // --- Configuración por variables de entorno ---
+  const REPLY_TEXT =
+    process.env.REPLY_TEXT || "👋 Espere un momento, pronto será atendido.";
+  const COOLDOWN_MINUTES = Number(process.env.COOLDOWN_MINUTES || 10);
+  const MAX_DAILY_REPLIES = Number(process.env.MAX_DAILY_REPLIES || 3);
+  const THROTTLE_MS = Number(process.env.THROTTLE_MS || 1000); // mínimo 1s entre envíos
+  const BUSINESS_SCHEDULE = process.env.BUSINESS_SCHEDULE; // JSON weekly schedule
+
+  let lastSendAt = 0;
+
+  function minutesSinceMidnight(date) {
+    return date.getHours() * 60 + date.getMinutes();
+  }
+
+  function parseWeeklySchedule(json) {
+    if (!json) return null;
+    try {
+      const data = JSON.parse(json);
+      const normalized = {};
+      for (const key of Object.keys(data)) {
+        const day = String(Number(key));
+        if (!(day in normalized)) normalized[day] = [];
+        const ranges = Array.isArray(data[key]) ? data[key] : [];
+        for (const range of ranges) {
+          if (typeof range !== "string" || !range.includes("-")) continue;
+          const [startStr, endStr] = range.split("-");
+          const toMin = (hhmm) => {
+            const [h, m] = hhmm.split(":");
+            const hh = Math.max(0, Math.min(24, Number(h)));
+            const mm = Math.max(0, Math.min(59, Number(m || 0)));
+            return hh * 60 + mm;
+          };
+          const startMin = Math.min(24 * 60, toMin(startStr.trim()));
+          let endMin = toMin(endStr.trim());
+          if (endStr.trim() === "24:00") endMin = 24 * 60;
+          normalized[day].push({ startMin, endMin });
+        }
+      }
+      return normalized;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  const weeklySchedule = parseWeeklySchedule(BUSINESS_SCHEDULE);
+
+  function isWithinBusinessHours(date) {
+    // If a weekly schedule is provided, enforce it strictly
+    if (weeklySchedule) {
+      const dow = String(date.getDay()); // 0=Sunday ... 6=Saturday
+      const ranges = weeklySchedule[dow] || [];
+      if (ranges.length === 0) return false; // closed that day
+      const mins = minutesSinceMidnight(date);
+      for (const r of ranges) {
+        const s = r.startMin;
+        const e = r.endMin;
+        if (e >= s) {
+          if (mins >= s && mins < Math.min(e, 24 * 60)) return true;
+        } else {
+          if (mins >= s || mins < e) return true; // overnight
+        }
+      }
+      return false;
+    }
+    // If no schedule configured, treat as always open
+    return true;
+  }
+
+  function getDateKey(ts) {
+    const d = new Date(ts);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
   // --- Base de datos ---
   const db = await open({
     filename: "./messages.db",
@@ -23,6 +98,14 @@ process.on("unhandledRejection", (err) =>
       chat_id TEXT PRIMARY KEY,
       last_message_at INTEGER,
       last_auto_reply_at INTEGER
+    );
+  `);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS reply_stats (
+      chat_id TEXT,
+      date TEXT,
+      count INTEGER,
+      PRIMARY KEY (chat_id, date)
     );
   `);
 
@@ -81,28 +164,94 @@ process.on("unhandledRejection", (err) =>
     ]);
 
     if (!record) {
-      // First message: always respond immediately
-      await client.sendMessage(
-        chatId,
-        "👋 Espere un momento, pronto será atendido."
-      );
-      await db.run("INSERT INTO messages VALUES (?, ?, ?)", [chatId, now, now]);
+      const withinHours = isWithinBusinessHours(new Date(now));
+      if (withinHours) {
+        const dateKey = getDateKey(now);
+        const stat = await db.get(
+          "SELECT count FROM reply_stats WHERE chat_id = ? AND date = ?",
+          [chatId, dateKey]
+        );
+        const currentCount = stat ? stat.count : 0;
+        if (currentCount < MAX_DAILY_REPLIES) {
+          const wait = Math.max(0, THROTTLE_MS - (Date.now() - lastSendAt));
+          if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+          try {
+            await client.sendMessage(chatId, REPLY_TEXT);
+            lastSendAt = Date.now();
+          } catch (e) {
+            console.error("⚠️ Error enviando respuesta inicial:", e);
+          }
+          if (stat) {
+            await db.run(
+              "UPDATE reply_stats SET count = count + 1 WHERE chat_id = ? AND date = ?",
+              [chatId, dateKey]
+            );
+          } else {
+            await db.run(
+              "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1)",
+              [chatId, dateKey]
+            );
+          }
+          await db.run("INSERT INTO messages VALUES (?, ?, ?)", [
+            chatId,
+            now,
+            now,
+          ]);
+        } else {
+          await db.run("INSERT INTO messages VALUES (?, ?, ?)", [
+            chatId,
+            now,
+            0,
+          ]);
+        }
+      } else {
+        await db.run("INSERT INTO messages VALUES (?, ?, ?)", [chatId, now, 0]);
+      }
       return;
     }
 
     const diff = now - record.last_message_at;
     const cooldown = now - record.last_auto_reply_at;
-    const TEN_MIN = 10 * 60 * 1000;
+    const COOLDOWN_MS = COOLDOWN_MINUTES * 60 * 1000;
+    const withinHours = isWithinBusinessHours(new Date(now));
 
-    if (diff > TEN_MIN && cooldown > TEN_MIN) {
-      await client.sendMessage(
-        chatId,
-        "👋 Espere un momento, pronto será atendido."
+    if (diff > COOLDOWN_MS && cooldown > COOLDOWN_MS && withinHours) {
+      const dateKey = getDateKey(now);
+      const stat = await db.get(
+        "SELECT count FROM reply_stats WHERE chat_id = ? AND date = ?",
+        [chatId, dateKey]
       );
-      await db.run(
-        "UPDATE messages SET last_message_at = ?, last_auto_reply_at = ? WHERE chat_id = ?",
-        [now, now, chatId]
-      );
+      const currentCount = stat ? stat.count : 0;
+      if (currentCount < MAX_DAILY_REPLIES) {
+        const wait = Math.max(0, THROTTLE_MS - (Date.now() - lastSendAt));
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        try {
+          await client.sendMessage(chatId, REPLY_TEXT);
+          lastSendAt = Date.now();
+        } catch (e) {
+          console.error("⚠️ Error enviando respuesta automática:", e);
+        }
+        if (stat) {
+          await db.run(
+            "UPDATE reply_stats SET count = count + 1 WHERE chat_id = ? AND date = ?",
+            [chatId, dateKey]
+          );
+        } else {
+          await db.run(
+            "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1)",
+            [chatId, dateKey]
+          );
+        }
+        await db.run(
+          "UPDATE messages SET last_message_at = ?, last_auto_reply_at = ? WHERE chat_id = ?",
+          [now, now, chatId]
+        );
+      } else {
+        await db.run(
+          "UPDATE messages SET last_message_at = ? WHERE chat_id = ?",
+          [now, chatId]
+        );
+      }
     } else {
       await db.run(
         "UPDATE messages SET last_message_at = ? WHERE chat_id = ?",
@@ -129,4 +278,19 @@ process.on("unhandledRejection", (err) =>
   setInterval(() => {}, 60 * 1000);
 
   client.initialize();
+
+  // Cierre limpio del proceso
+  async function shutdown(signal) {
+    try {
+      console.log(`↘️ Recibida señal ${signal}, cerrando recursos...`);
+      await client.destroy();
+      await db.close();
+    } catch (e) {
+      console.error("Error en cierre:", e);
+    } finally {
+      process.exit(0);
+    }
+  }
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 })();
