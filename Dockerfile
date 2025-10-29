@@ -23,4 +23,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
 COPY . .
+
+# Set memory limit for Node.js (to stay within free tier limits)
+ENV NODE_OPTIONS="--max-old-space-size=256"
+
 CMD ["npm", "start"]

@@ -40,6 +40,23 @@ process.on("unhandledRejection", (err) =>
         "--no-first-run",
         "--no-zygote",
         "--disable-gpu",
+        "--single-process", // Reduces memory usage
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=TranslateUI",
+        "--disable-ipc-flooding-protection",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-background-downloads",
+        "--disable-add-to-shelf",
+        "--disable-breakpad",
+        "--disable-client-side-phishing-detection",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-features=AudioServiceOutOfProcess",
       ],
     },
   });
@@ -94,11 +111,19 @@ process.on("unhandledRejection", (err) =>
     }
   });
 
-  // Limpieza semanal
+  // Limpieza semanal y optimización de base de datos
   setInterval(async () => {
-    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    await db.run("DELETE FROM messages WHERE last_message_at < ?", [cutoff]);
-  }, 60 * 60 * 1000);
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
+    const result = await db.run(
+      "DELETE FROM messages WHERE last_message_at < ?",
+      [cutoff]
+    );
+    console.log(`🧹 Limpieza: ${result.changes} registros eliminados`);
+
+    // Vacuum database to reclaim disk space
+    await db.run("VACUUM");
+    console.log("✅ Base de datos optimizada");
+  }, 60 * 60 * 1000); // Every hour
 
   // Mantener proceso activo
   setInterval(() => {}, 60 * 1000);
