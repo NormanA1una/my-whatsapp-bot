@@ -3,6 +3,8 @@ const qrcode = require("qrcode-terminal");
 const sqlite3 = require("sqlite3");
 const { open } = require("sqlite");
 const puppeteer = require("puppeteer");
+const fs = require("fs");
+const path = require("path");
 
 // --- Manejo de errores globales ---
 process.on("uncaughtException", (err) =>
@@ -109,9 +111,17 @@ process.on("unhandledRejection", (err) =>
     );
   `);
 
+  // --- Persistencia de sesión: asegúrate de que el directorio exista ---
+  const SESSION_DIR = process.env.WWEBJS_DATA_PATH || ".wwebjs_auth";
+  try {
+    fs.mkdirSync(path.resolve(SESSION_DIR), { recursive: true });
+  } catch (e) {
+    console.error("⚠️ No se pudo crear el directorio de sesión:", e);
+  }
+
   // --- Cliente WhatsApp ---
   const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
     puppeteer: {
       executablePath: puppeteer.executablePath(),
       headless: true,
@@ -181,31 +191,25 @@ process.on("unhandledRejection", (err) =>
           } catch (e) {
             console.error("⚠️ Error enviando respuesta inicial:", e);
           }
-          if (stat) {
-            await db.run(
-              "UPDATE reply_stats SET count = count + 1 WHERE chat_id = ? AND date = ?",
-              [chatId, dateKey]
-            );
-          } else {
-            await db.run(
-              "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1)",
-              [chatId, dateKey]
-            );
-          }
-          await db.run("INSERT INTO messages VALUES (?, ?, ?)", [
-            chatId,
-            now,
-            now,
-          ]);
+          await db.run(
+            "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1) ON CONFLICT(chat_id, date) DO UPDATE SET count = reply_stats.count + 1",
+            [chatId, dateKey]
+          );
+          await db.run(
+            "INSERT INTO messages (chat_id, last_message_at, last_auto_reply_at) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET last_message_at = excluded.last_message_at, last_auto_reply_at = excluded.last_auto_reply_at",
+            [chatId, now, now]
+          );
         } else {
-          await db.run("INSERT INTO messages VALUES (?, ?, ?)", [
-            chatId,
-            now,
-            0,
-          ]);
+          await db.run(
+            "INSERT INTO messages (chat_id, last_message_at, last_auto_reply_at) VALUES (?, ?, 0) ON CONFLICT(chat_id) DO UPDATE SET last_message_at = excluded.last_message_at",
+            [chatId, now]
+          );
         }
       } else {
-        await db.run("INSERT INTO messages VALUES (?, ?, ?)", [chatId, now, 0]);
+        await db.run(
+          "INSERT INTO messages (chat_id, last_message_at, last_auto_reply_at) VALUES (?, ?, 0) ON CONFLICT(chat_id) DO UPDATE SET last_message_at = excluded.last_message_at",
+          [chatId, now]
+        );
       }
       return;
     }
@@ -231,17 +235,10 @@ process.on("unhandledRejection", (err) =>
         } catch (e) {
           console.error("⚠️ Error enviando respuesta automática:", e);
         }
-        if (stat) {
-          await db.run(
-            "UPDATE reply_stats SET count = count + 1 WHERE chat_id = ? AND date = ?",
-            [chatId, dateKey]
-          );
-        } else {
-          await db.run(
-            "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1)",
-            [chatId, dateKey]
-          );
-        }
+        await db.run(
+          "INSERT INTO reply_stats (chat_id, date, count) VALUES (?, ?, 1) ON CONFLICT(chat_id, date) DO UPDATE SET count = reply_stats.count + 1",
+          [chatId, dateKey]
+        );
         await db.run(
           "UPDATE messages SET last_message_at = ?, last_auto_reply_at = ? WHERE chat_id = ?",
           [now, now, chatId]
